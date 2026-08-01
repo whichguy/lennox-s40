@@ -146,7 +146,12 @@ def config_lock():
         os.close(fd)
 
 
-def load_config() -> dict[str, Any]:
+def load_config(*, fail_closed: bool = True) -> dict[str, Any]:
+    """Load running config.
+
+    Missing file → empty defaults (ok).
+    Existing but malformed / non-dict → CliError EX_BAD_REQ (3); file left untouched.
+    """
     path = config_path()
     if not os.path.isfile(path):
         return {"version": CONFIG_VERSION}
@@ -154,10 +159,14 @@ def load_config() -> dict[str, Any]:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            return {"version": CONFIG_VERSION}
+            raise CliError(EX_BAD_REQ, f"malformed config (not an object): {path}")
         data.setdefault("version", CONFIG_VERSION)
         return data
+    except CliError:
+        raise
     except (OSError, json.JSONDecodeError) as e:
+        if fail_closed:
+            raise CliError(EX_BAD_REQ, f"malformed config {path}: {e}") from e
         print(f"lennox-s40: warning: bad config {path}: {e}", file=sys.stderr)
         return {"version": CONFIG_VERSION}
 

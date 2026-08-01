@@ -56,3 +56,29 @@ def test_zone_dict_hold():
     d = m.zone_dict(z)
     assert d["schedule_hold"] is True
     assert d["active"] is True
+
+
+def test_pick_zone_empty_is_device_error():
+    with pytest.raises(m.CliError) as e:
+        m.pick_zone(_sys([]), None, for_write=True)
+    assert e.value.code == m.EX_DEVICE
+
+
+def test_pick_zone_no_active_is_device_error():
+    z0 = SimpleNamespace(id=0, name="Ghost", temperature=None)
+    with pytest.raises(m.CliError) as e:
+        m.pick_zone(_sys([z0]), None, for_write=True)
+    assert e.value.code == m.EX_DEVICE
+
+
+def test_pick_zone_substring_disabled_for_write():
+    z0 = SimpleNamespace(id=0, name="Downstairs", temperature=70)
+    with pytest.raises(m.CliError) as e:
+        m.pick_zone(_sys([z0]), "Down", for_write=True)
+    assert e.value.code == m.EX_BAD_REQ
+
+
+def test_pick_zone_substring_ok_for_read():
+    z0 = SimpleNamespace(id=0, name="Downstairs", temperature=70)
+    z = m.pick_zone(_sys([z0]), "Down", for_write=False)
+    assert z is z0

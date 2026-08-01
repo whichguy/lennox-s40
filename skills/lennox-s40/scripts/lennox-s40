@@ -105,6 +105,53 @@ if [[ "$do_setup" -eq 1 ]]; then
   exit 0
 fi
 
+# Dep-free subcommands: use any python3 (do not require lennoxs30api).
+# Constraint: works with empty LENNOX_VENV and on CI.
+is_depfree_dispatch() {
+  case "${1:-}" in
+    -h|--help|--version) return 0 ;;
+    version|config) return 0 ;;
+  esac
+  # Leading globals then version/config/--help/--version
+  local a skip_next=0
+  for a in "$@"; do
+    if [[ "$skip_next" -eq 1 ]]; then
+      skip_next=0
+      continue
+    fi
+    case "$a" in
+      -h|--help|--version) return 0 ;;
+      --)
+        continue
+        ;;
+      --ip|--app-id|--zone)
+        # value-taking flags — skip the next token
+        skip_next=1
+        continue
+        ;;
+      --full|--first-zone|--lan-scan|--no-lan-scan|--no-rediscover|--probe-only)
+        continue
+        ;;
+      -*)
+        continue
+        ;;
+      version|config) return 0 ;;
+      *) return 1 ;;
+    esac
+  done
+  return 1
+}
+
+boot_py="$(pick_bootstrap_python)" || {
+  printf 'lennox-s40: python3 not found (set LENNOX_PYTHON)\n' >&2
+  exit 2
+}
+
+if is_depfree_dispatch "$@"; then
+  # Bootstrap interpreter only — no venv/deps required
+  exec "$boot_py" "$py_script" "$@"
+fi
+
 py=""
 if ! py="$(resolve_python)"; then
   printf 'lennox-s40: lennoxs30api not importable. Run once:\n' >&2

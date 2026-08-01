@@ -44,10 +44,56 @@ run_py config clear >/dev/null
 [[ ! -e "$LENNOX_CONFIG" ]] || fail "clear left file"
 pass "config show/clear"
 
-# version
+# version (module path)
 v=$(run_py version)
 [[ -n "$v" ]] || fail "version empty"
 pass "version $v"
+
+# --- Wrapper dep-free path: empty LENNOX_VENV must still run version/config ---
+empty_venv="$tmpdir/empty-venv-dir"
+mkdir -p "$empty_venv"
+# Isolate from ambient LENNOX_PYTHON so bootstrap must use system python3
+set +e
+wrap_ver="$(
+  env -u LENNOX_PYTHON -u LENNOX_IP \
+    LENNOX_VENV="$empty_venv" \
+    LENNOX_CONFIG="$tmpdir/wrap-config.json" \
+    "$cli" version 2>&1
+)"
+wrap_ver_rc=$?
+wrap_path="$(
+  env -u LENNOX_PYTHON -u LENNOX_IP \
+    LENNOX_VENV="$empty_venv" \
+    LENNOX_CONFIG="$tmpdir/wrap-config.json" \
+    "$cli" config path 2>&1
+)"
+wrap_path_rc=$?
+wrap_help="$(
+  env -u LENNOX_PYTHON \
+    LENNOX_VENV="$empty_venv" \
+    "$cli" --help 2>&1
+)"
+wrap_help_rc=$?
+set -e
+[[ "$wrap_ver_rc" -eq 0 ]] || fail "wrapper version empty-VENV rc=$wrap_ver_rc: $wrap_ver"
+[[ -n "$wrap_ver" ]] || fail "wrapper version empty-VENV empty output"
+[[ "$wrap_path_rc" -eq 0 ]] || fail "wrapper config path empty-VENV rc=$wrap_path_rc: $wrap_path"
+[[ "$wrap_path" == "$tmpdir/wrap-config.json" ]] || fail "wrapper config path mismatch: $wrap_path"
+[[ "$wrap_help_rc" -eq 0 ]] || fail "wrapper --help empty-VENV rc=$wrap_help_rc"
+pass "wrapper dep-free empty LENNOX_VENV (version/config/help)"
+
+# Network path still needs deps — empty venv without library → EX_DEPS=2
+set +e
+wrap_status_out="$(
+  env -u LENNOX_PYTHON -u LENNOX_IP \
+    LENNOX_VENV="$empty_venv" \
+    LENNOX_CONFIG="$tmpdir/nope.json" \
+    "$cli" --ip 203.0.113.1 --no-rediscover status 2>&1
+)"
+wrap_status_rc=$?
+set -e
+[[ "$wrap_status_rc" -eq 2 ]] || fail "wrapper status empty-VENV must be EX_DEPS=2, got $wrap_status_rc: $wrap_status_out"
+pass "wrapper empty-VENV network path EX_DEPS (rc=2)"
 
 # dead IP without rediscover / lan scan — must drive real CLI and assert EX_NOT_FOUND=1
 # (do not use `env run_py`: env cannot invoke shell functions → false 127)
@@ -59,9 +105,27 @@ out="$(
 rc=$?
 set -e
 [[ "$rc" -eq 1 ]] || fail "dead ip must exit 1 (EX_NOT_FOUND), got $rc: $out"
-printf '%s\n' "$out" | grep -qi 'Connect failed\|No reachable\|No thermostat' \
-  || fail "dead ip message missing: $out"
-pass "fail-closed dead ip (rc=$rc)"
+# Exact diagnostic (AC3) — not a loose non-zero / alternate message
+printf '%s\n' "$out" | grep -F 'Connect failed for 203.0.113.1' \
+  || fail "dead ip exact message missing: $out"
+pass "fail-closed dead ip (rc=$rc, Connect failed for 203.0.113.1)"
+
+# malformed config: EX_BAD_REQ=3, path on stderr, file preserved (sha256 stable)
+bad_cfg="$tmpdir/bad.json"
+printf '%s' '{not-json' >"$bad_cfg"
+sha_before=$(shasum -a 256 "$bad_cfg" | awk '{print $1}')
+set +e
+bad_out="$(
+  env LENNOX_CONFIG="$bad_cfg" "$LENNOX_PYTHON" "$py" config show 2>&1
+)"
+bad_rc=$?
+set -e
+sha_after=$(shasum -a 256 "$bad_cfg" | awk '{print $1}')
+[[ "$bad_rc" -eq 3 ]] || fail "malformed config must exit 3 (EX_BAD_REQ), got $bad_rc: $bad_out"
+[[ "$sha_before" == "$sha_after" ]] || fail "malformed config file mutated ($sha_before -> $sha_after)"
+printf '%s\n' "$bad_out" | grep -F "$bad_cfg" \
+  || fail "malformed config stderr must name path $bad_cfg: $bad_out"
+pass "malformed config fail-closed (rc=3, path on stderr, sha256 preserved)"
 
 # python parse
 python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$py" || fail "parse"
