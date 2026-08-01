@@ -6,7 +6,9 @@
 # From skills/lennox-s40 (repo clone or installed leaf)
 bash scripts/lennox-s40 --setup
 
-# Discover S40 on LAN (mDNS + Connect probe) — writes running config
+# Discover S40 on LAN (mDNS + Connect probe).
+# Default: open a full session, then save identity to config.
+# Probe only (no write): bash scripts/lennox-s40 discover --probe-only
 bash scripts/lennox-s40 discover
 
 # Later commands use config automatically (no LENNOX_IP required)
@@ -25,6 +27,8 @@ Persisted JSON (mode `0600`):
 
 Typical fields: `ip`, `host` (mDNS), `app_id`, `serial`, `last_ok_at`, `updated_at`.
 
+Missing config is fine (empty defaults). **Existing but malformed JSON fails closed** (exit 3; file preserved).
+
 ```sh
 bash scripts/lennox-s40 config show
 bash scripts/lennox-s40 config path
@@ -38,7 +42,9 @@ bash scripts/lennox-s40 config clear
 3. config `ip` / `host`
 4. mDNS + Connect probe
 
-If the chosen address **fails Connect**, the CLI **rediscovers** (unless `--no-rediscover`), saves the new IP, and continues. Successful sessions also refresh config from the unit (`wifi_ip`, serial).
+If the chosen address **fails Connect**, the CLI **rediscovers** (unless `--no-rediscover`) and continues with the new IP. Config is rewritten only after a **verified session** (or successful control command), not from Connect probe alone.
+
+Optional LAN /24 Connect sweep: `--lan-scan` (default off; honor `LENNOX_NO_LAN_SCAN=1`).
 
 Optional: reserve DHCP for the thermostat MAC on your router so IP churn is rare.
 

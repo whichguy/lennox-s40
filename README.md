@@ -26,21 +26,23 @@ test/
 cd ~/src/lennox-s40
 ./install.sh                          # Claude + Grok + Codex + Hermes
 bash skills/lennox-s40/scripts/lennox-s40 --setup
-bash skills/lennox-s40/scripts/lennox-s40 discover   # saves ~/.config/lennox-s40/config.json
+bash skills/lennox-s40/scripts/lennox-s40 discover   # session-verified save → config
 bash skills/lennox-s40/scripts/lennox-s40 status
 ```
 
 Running config: `~/.config/lennox-s40/config.json`  
-If the last IP dies, the CLI rediscovers (mDNS / serial host / optional /24 scan) and rewrites config.
+If the last IP dies, the CLI rediscovers (mDNS / serial host / optional /24 scan) and rewrites config after a verified session.
 
 ## CLI
 
 | Command | Effect |
 |---------|--------|
-| `discover` | Probe LAN; persist first good IP |
+| `discover` | Probe LAN; persist after verified session (`--probe-only` to skip save) |
 | `status` | System + zones JSON |
-| `mode` / `cool` / `heat` / `fan` / `away` | Control |
+| `mode` / `cool` / `heat` / `fan` / `away` / `hold` | Control |
 | `config show\|path\|clear` | Running config |
+
+Exit codes: `0` ok · `1` unreachable · `2` missing deps · `3` bad args/config · `4` device · `5` timeout.
 
 Env: `LENNOX_IP`, `LENNOX_APP_ID`, `LENNOX_CONFIG`, `LENNOX_VENV`, `LENNOX_NO_LAN_SCAN`.
 

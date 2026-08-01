@@ -4,7 +4,7 @@
 
 | Symptom | Action |
 |---------|--------|
-| Sticky wrong IP / always fails session | `lennox-s40 config clear` then `discover --verify-session` or `--ip <known>` |
+| Sticky wrong IP / always fails session | `lennox-s40 config clear` then `discover` (session-verified save by default) or `lennox-s40 --ip <known> status`. Use `discover --probe-only` to scan without writing config |
 | Phone app + skill fighting | Ensure unique `app_id` in config (auto-generated on 0.2+). Avoid shared library default. |
 | Schedule stuck after setpoint | `lennox-s40 hold off --zone NAME` |
 | Multi-zone write refused | Pass `--zone Downstairs` (or `--first-zone`) |

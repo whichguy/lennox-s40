@@ -63,7 +63,7 @@ bash scripts/lennox-s40 config show
 
 | Command | Effect |
 |---------|--------|
-| `discover` | mDNS + Connect probe; **persist** first good IP to config |
+| `discover` | mDNS + Connect probe; **persist only after a verified session** (identity proven). Use `discover --probe-only` to print matches without writing config |
 | `status` | JSON system + zones; updates config on success |
 | `mode` / `cool` / `heat` / `fan` / `away` | control (same resolve path) |
 | `hold on\|off\|status` | schedule hold (report/clear) |
@@ -71,12 +71,13 @@ bash scripts/lennox-s40 config show
 
 **Resolve order:** `--ip` → `LENNOX_IP` → config → discover.  
 **Stale IP:** Connect/session fail → rediscover (exclude bad IP) → retry (`--no-rediscover` to disable).
-**LAN /24 scan:** opt-in via `--lan-scan` (default off).
+**LAN /24 scan:** opt-in via `--lan-scan` (default off); suppressed when `LENNOX_NO_LAN_SCAN=1`.
 **App id:** unique install-scoped id auto-generated (not shared library default).
+**Malformed config:** existing but invalid JSON → exit **3**; file left byte-identical (no silent reset).
 
-Exit codes: `0` ok · `1` soft failure (discover miss) · `2` missing deps.
+Exit codes: `0` ok · `1` not found / unreachable · `2` missing deps · `3` bad request (args/config) · `4` device/protocol · `5` timeout / not ready.
 
-Env: `LENNOX_IP`, `LENNOX_APP_ID`, `LENNOX_CONFIG`, `LENNOX_VENV`, `LENNOX_PYTHON`, `LENNOX_TIMEOUT`.
+Env: `LENNOX_IP`, `LENNOX_APP_ID`, `LENNOX_CONFIG`, `LENNOX_VENV`, `LENNOX_PYTHON`, `LENNOX_TIMEOUT`, `LENNOX_NO_LAN_SCAN`.
 
 ## Protocol (local)
 
