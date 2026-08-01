@@ -993,39 +993,40 @@ def cmd_discover(args) -> int:
             first = {"ip": ip, "host": ""}
             break
     if first:
-        # Persist only after optional full session if --verify-session
-        if getattr(args, "verify_session", False):
-            async def _verify():
-                api = await connect(first["ip"], app_id)
-                try:
-                    system, ready = await pump_until_ready(api)
-                    if not ready:
-                        raise CliError(EX_TIMEOUT, "discovered but system not ready")
-                    return remember_identity(
-                        cfg,
-                        ip=first["ip"],
-                        app_id=app_id,
-                        host=first.get("host") or "",
-                        serial=getattr(system, "serialNumber", None),
-                        product=getattr(system, "productType", None),
-                    )
-                finally:
-                    await api.shutdown()
+        # Persist only after a full session proves identity (needs lennoxs30api).
+        # --probe-only: print match without writing config.
+        if getattr(args, "probe_only", False):
+            print()
+            print(f"probe-only match: ip={first['ip']} (config not written)")
+            return EX_OK
 
-            asyncio.run(_verify())
-        else:
-            # still require CN probe already done; persist probe-level for ops convenience
-            # but mark as unverified_session
-            cfg2 = remember_identity(
-                cfg,
-                ip=first["ip"],
-                app_id=app_id,
-                host=first.get("host") or "",
-            )
-            cfg2["session_verified"] = False
-            save_config(cfg2)
+        async def _verify_and_save():
+            api = await connect(first["ip"], app_id)
+            try:
+                system, ready = await pump_until_ready(api)
+                if not ready:
+                    raise CliError(EX_TIMEOUT, "discovered but system not ready")
+                serial = getattr(system, "serialNumber", None)
+                host = first.get("host") or ""
+                if serial:
+                    host = f"Lennox-S40-{serial}.local"
+                remember_identity(
+                    cfg,
+                    ip=first["ip"],
+                    app_id=app_id,
+                    host=host,
+                    serial=serial,
+                    product=getattr(system, "productType", None),
+                )
+            finally:
+                await api.shutdown()
+
+        try:
+            asyncio.run(_verify_and_save())
+        except CliError:
+            raise
         print()
-        print(f"saved config: ip={first['ip']} app_id={app_id}")
+        print(f"saved config: ip={first['ip']} app_id={app_id} (session verified)")
         print(f"  path: {config_path()}")
     return EX_OK if found_any else EX_NOT_FOUND
 
@@ -1104,9 +1105,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discover")
     s.add_argument(
-        "--verify-session",
+        "--probe-only",
         action="store_true",
-        help="full subscribe before saving config",
+        help="print matching hosts without writing config (no session)",
     )
     s.set_defaults(func=cmd_discover)
 
