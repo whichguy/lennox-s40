@@ -1,67 +1,117 @@
 #!/usr/bin/env python3
 """Local-only CLI for Lennox S40 (and S30/E30 LAN) thermostats.
 
-Uses the reverse-engineered lennoxs30api library over HTTPS on the LAN.
-No cloud credentials. No password. Self-signed TLS is expected.
+Exit codes:
+  0 ok
+  1 unreachable / not found / soft closed
+  2 missing deps
+  3 bad request (args / validation)
+  4 device / protocol error
+  5 timeout / not ready
 
-Running config (persisted JSON):
-  $LENNOX_CONFIG  or  $XDG_CONFIG_HOME/lennox-s40/config.json
-  or  ~/.config/lennox-s40/config.json
-
-  Fields: ip, host, app_id, serial, last_ok_at, updated_at
-
-Resolution order for address:
-  1. --ip (explicit)
-  2. LENNOX_IP env
-  3. config ip/host
-  4. mDNS + Connect probe (discover)
-
-If the chosen address fails Connect, rediscover automatically (unless
---no-rediscover), write the new address to config, and retry once.
-
-Env:
-  LENNOX_IP, LENNOX_APP_ID, LENNOX_TIMEOUT, LENNOX_CONFIG, LENNOX_POLL_MAX
-
-Commands:
-  status | mode | cool | heat | fan | away | discover | config
+Running config: $LENNOX_CONFIG or ~/.config/lennox-s40/config.json
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
+import math
 import os
 import re
+import secrets
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-try:
-    from lennoxs30api.s30api_async import s30api_async
-except ImportError:
-    print(
-        "lennoxs30api not installed. Run: bash scripts/lennox-s40 --setup\n"
-        "or: pip install lennoxs30api aiohttp pytz",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+VERSION = "0.2.0"
 
-ENV_IP = os.environ.get("LENNOX_IP", "").strip()
-ENV_APP_ID = os.environ.get("LENNOX_APP_ID", "").strip()
-DEFAULT_APP_ID = "mapp079372367644467046827200"
-DEFAULT_TIMEOUT = int(os.environ.get("LENNOX_TIMEOUT", "90"))
-POLL_MAX = int(os.environ.get("LENNOX_POLL_MAX", "80"))
-PROBE_TIMEOUT = float(os.environ.get("LENNOX_PROBE_TIMEOUT", "4"))
-# Set LENNOX_NO_LAN_SCAN=1 to skip /24 Connect sweep (tests / slow networks)
-ENV_NO_LAN_SCAN = os.environ.get("LENNOX_NO_LAN_SCAN", "").strip() in {"1", "true", "yes"}
+# Lazy-loaded upstream client (optional for config/discover without venv)
+s30api_async = None  # type: ignore
+S30Exception = Exception  # type: ignore
+_IMPORT_ERR: Optional[BaseException] = None
 
+
+def _load_api() -> None:
+    global s30api_async, S30Exception, _IMPORT_ERR
+    if s30api_async is not None:
+        return
+    try:
+        from lennoxs30api.s30api_async import s30api_async as _api
+        from lennoxs30api.s30exception import S30Exception as _exc
+
+        s30api_async = _api
+        S30Exception = _exc
+        _IMPORT_ERR = None
+    except ImportError as e:
+        _IMPORT_ERR = e
+        print(
+            "lennoxs30api not installed. Run: bash scripts/lennox-s40 --setup\n"
+            "or: pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from e
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"lennox-s40: warning: invalid {name}={raw!r}, using {default}", file=sys.stderr)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"lennox-s40: warning: invalid {name}={raw!r}, using {default}", file=sys.stderr)
+        return default
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+DEFAULT_TIMEOUT = _env_int("LENNOX_TIMEOUT", 90)
+POLL_MAX = _env_int("LENNOX_POLL_MAX", 40)
+PROBE_TIMEOUT = _env_float("LENNOX_PROBE_TIMEOUT", 4.0)
+SESSION_DEADLINE = _env_float("LENNOX_SESSION_DEADLINE", 90.0)
+ENV_NO_LAN_SCAN = _env_flag("LENNOX_NO_LAN_SCAN")
+ENV_FULL = _env_flag("LENNOX_FULL")
 CONFIG_VERSION = 1
+LEGACY_SHARED_APP_ID = "mapp079372367644467046827200"
+
+# Exit helpers
+EX_OK = 0
+EX_NOT_FOUND = 1
+EX_DEPS = 2
+EX_BAD_REQ = 3
+EX_DEVICE = 4
+EX_TIMEOUT = 5
+
+
+class CliError(SystemExit):
+    def __init__(self, code: int, message: str):
+        super().__init__(code)
+        self.code = code
+        self.message = message
+        print(f"lennox-s40: {message}", file=sys.stderr)
 
 
 def _utc_now() -> str:
@@ -70,9 +120,31 @@ def _utc_now() -> str:
 
 def config_path() -> str:
     if os.environ.get("LENNOX_CONFIG"):
-        return os.path.expanduser(os.environ["LENNOX_CONFIG"])
+        p = os.path.expanduser(os.environ["LENNOX_CONFIG"])
+        return p if p else os.path.join(tempfile.gettempdir(), "lennox-s40-config.json")
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
     return os.path.join(xdg, "lennox-s40", "config.json")
+
+
+def lock_path() -> str:
+    return config_path() + ".lock"
+
+
+@contextmanager
+def config_lock():
+    path = lock_path()
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def load_config() -> dict[str, Any]:
@@ -93,37 +165,145 @@ def load_config() -> dict[str, Any]:
 
 def save_config(cfg: dict[str, Any]) -> None:
     path = config_path()
-    parent = os.path.dirname(path)
+    parent = os.path.dirname(path) or "."
     os.makedirs(parent, mode=0o700, exist_ok=True)
     cfg = dict(cfg)
     cfg["version"] = CONFIG_VERSION
     cfg["updated_at"] = _utc_now()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    payload = json.dumps(cfg, indent=2, sort_keys=True) + "\n"
+    with config_lock():
+        fd, tmp = tempfile.mkstemp(prefix=".lennox-", suffix=".tmp", dir=parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            try:
+                dir_fd = os.open(parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def generate_app_id() -> str:
+    return f"mapp{secrets.randbelow(10**24):024d}"
+
+
+def env_ip() -> str:
+    return os.environ.get("LENNOX_IP", "").strip()
+
+
+def env_app_id() -> str:
+    return os.environ.get("LENNOX_APP_ID", "").strip()
+
+
+def effective_app_id(args, cfg: dict[str, Any]) -> str:
+    """Precedence: --app-id > LENNOX_APP_ID > config (non-legacy) > generate."""
+    flag = getattr(args, "app_id", None)
+    if flag:
+        return str(flag).strip()
+    if env_app_id():
+        return env_app_id()
+    existing = (cfg.get("app_id") or "").strip()
+    if existing and existing != LEGACY_SHARED_APP_ID:
+        return existing
+    # migrate off shared library default
+    new_id = generate_app_id()
+    cfg = dict(cfg)
+    cfg["app_id"] = new_id
+    save_config(cfg)
+    print(f"lennox-s40: generated unique app_id (saved to config)", file=sys.stderr)
+    return new_id
 
 
 def resolve_host(host: str) -> str:
-    """Return dotted IP; leave already-IP strings alone."""
     host = host.strip()
     if not host:
-        raise SystemExit("empty host")
-    if all(p.isdigit() for p in host.split(".")) and host.count(".") == 3:
+        raise CliError(EX_BAD_REQ, "empty host")
+    if _is_ip(host):
         return host
     try:
         return socket.gethostbyname(host)
     except socket.gaierror as e:
-        raise SystemExit(f"Cannot resolve host {host!r}: {e}") from e
+        raise CliError(EX_NOT_FOUND, f"Cannot resolve host {host!r}: {e}") from e
 
 
-def probe_connect(ip: str, app_id: str, timeout: float = PROBE_TIMEOUT) -> bool:
-    """Fast HTTPS Connect check (self-signed OK)."""
+def _is_ip(s: str) -> bool:
+    parts = s.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
+def _tls_peer_cn(ip: str, timeout: float = PROBE_TIMEOUT) -> Optional[str]:
+    try:
+        ctx = ssl._create_unverified_context()
+        with socket.create_connection((ip, 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=ip) as ssock:
+                cert = ssock.getpeercert(binary_form=False)
+                if not cert:
+                    # binary form for self-signed often empty subject in getpeercert
+                    der = ssock.getpeercert(binary_form=True)
+                    if not der:
+                        return None
+                    # parse CN roughly from openssl text if needed
+                    return _cn_from_der(der)
+                subj = cert.get("subject", ())
+                for rdn in subj:
+                    for k, v in rdn:
+                        if k == "commonName":
+                            return v
+    except Exception:
+        return None
+    return None
+
+
+def _cn_from_der(der: bytes) -> Optional[str]:
+    try:
+        # stdlib only: use ssl to re-dump via openssl not available; try cryptography-free regex on openssl x509
+        # Fallback: shell openssl if present
+        import subprocess as sp
+
+        p = sp.run(
+            ["openssl", "x509", "-noout", "-subject", "-inform", "DER"],
+            input=der,
+            capture_output=True,
+            timeout=2,
+        )
+        text = (p.stdout or b"").decode("utf-8", "replace")
+        m = re.search(r"CN\s*=\s*([^,/]+)", text)
+        return m.group(1).strip() if m else None
+    except Exception:
+        return None
+
+
+def probe_connect(
+    ip: str,
+    app_id: str,
+    timeout: float = PROBE_TIMEOUT,
+    *,
+    require_lennox_cn: bool = True,
+) -> bool:
+    """HTTPS Connect + optional CN=Lennox identity check."""
+    if require_lennox_cn:
+        cn = _tls_peer_cn(ip, timeout=timeout)
+        if cn is not None and "lennox" not in cn.lower():
+            return False
+        # if cn is None (parse failed), still try HTTP — many S40 certs parse poorly
     url = f"https://{ip}/Endpoints/{app_id}/Connect"
     ctx = ssl._create_unverified_context()
     try:
@@ -137,7 +317,6 @@ def probe_connect(ip: str, app_id: str, timeout: float = PROBE_TIMEOUT) -> bool:
 
 
 def _mdns_s40_hosts(seconds: float = 5.0) -> list[str]:
-    """Browse mDNS; dns-sd streams forever so we sample then kill."""
     hosts: list[str] = []
     try:
         proc = subprocess.Popen(
@@ -149,7 +328,6 @@ def _mdns_s40_hosts(seconds: float = 5.0) -> list[str]:
     except (FileNotFoundError, OSError):
         return hosts
     try:
-        # sample for a few seconds
         try:
             out, _ = proc.communicate(timeout=seconds)
         except subprocess.TimeoutExpired:
@@ -162,7 +340,7 @@ def _mdns_s40_hosts(seconds: float = 5.0) -> list[str]:
         except Exception:
             pass
         return hosts
-    for m in re.finditer(r"Lennox-S40-[A-Za-z0-9]+\.local", out, re.I):
+    for m in re.finditer(r"Lennox-(?:S40|S30|E30)-[A-Za-z0-9]+\.local", out, re.I):
         h = m.group(0)
         if h not in hosts:
             hosts.append(h)
@@ -170,40 +348,31 @@ def _mdns_s40_hosts(seconds: float = 5.0) -> list[str]:
 
 
 def _local_ipv4_prefixes() -> list[str]:
-    """Best-effort primary interface /24 prefixes for LAN scan fallback."""
     prefixes: list[str] = []
     try:
-        # UDP trick: no packets sent
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         if _is_ip(ip) and not ip.startswith("127."):
-            parts = ip.split(".")
-            prefixes.append(".".join(parts[:3]) + ".")
+            prefixes.append(".".join(ip.split(".")[:3]) + ".")
     except OSError:
         pass
     return prefixes
 
 
 def _scan_lan_lennox(app_id: str, prefixes: Optional[list[str]] = None) -> list[tuple[str, str]]:
-    """Parallel Connect probe of local /24s — last-resort discovery."""
     import concurrent.futures
 
     prefixes = prefixes or _local_ipv4_prefixes()
     if not prefixes:
         return []
-    targets: list[str] = []
-    for pref in prefixes:
-        for i in range(1, 255):
-            targets.append(f"{pref}{i}")
-
+    targets = [f"{pref}{i}" for pref in prefixes for i in range(1, 255)]
     found: list[tuple[str, str]] = []
 
     def check(ip: str) -> Optional[str]:
         return ip if probe_connect(ip, app_id, timeout=1.5) else None
 
-    # bounded workers so we don't thrash
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
         futs = {ex.submit(check, ip): ip for ip in targets}
         for fut in concurrent.futures.as_completed(futs):
@@ -217,16 +386,16 @@ def discover_candidates(
     *,
     prefer: Optional[str] = None,
     cfg: Optional[dict[str, Any]] = None,
-    app_id: str = DEFAULT_APP_ID,
-    allow_lan_scan: bool = True,
+    exclude: Optional[set[str]] = None,
 ) -> list[tuple[str, str]]:
-    """Return ordered list of (label, resolved_ip) candidates."""
     cfg = cfg or {}
+    exclude = exclude or set()
     labels: list[str] = []
     if prefer:
         labels.append(prefer)
-    if ENV_IP and ENV_IP not in labels:
-        labels.append(ENV_IP)
+    eip = env_ip()
+    if eip and eip not in labels:
+        labels.append(eip)
     for key in ("ip", "host"):
         v = (cfg.get(key) or "").strip()
         if v and v not in labels:
@@ -241,23 +410,16 @@ def discover_candidates(
             labels.append(h)
 
     out: list[tuple[str, str]] = []
-    seen_ip: set[str] = set()
+    seen: set[str] = set()
     for lab in labels:
         try:
             ip = resolve_host(lab)
         except SystemExit:
             continue
-        if ip in seen_ip:
+        if ip in exclude or ip in seen:
             continue
-        seen_ip.add(ip)
+        seen.add(ip)
         out.append((lab, ip))
-
-    # If nothing resolved (or only dead IPs will fail later), add LAN scan results
-    if allow_lan_scan and not out:
-        for lab, ip in _scan_lan_lennox(app_id):
-            if ip not in seen_ip:
-                seen_ip.add(ip)
-                out.append((lab, ip))
     return out
 
 
@@ -267,100 +429,83 @@ def discover_live(
     prefer: Optional[str] = None,
     cfg: Optional[dict[str, Any]] = None,
     quiet: bool = False,
-    allow_lan_scan: bool = True,
+    allow_lan_scan: bool = False,
+    exclude: Optional[set[str]] = None,
 ) -> Optional[dict[str, str]]:
-    """Probe candidates; return {ip, host_label} for first Connect success."""
     if ENV_NO_LAN_SCAN:
         allow_lan_scan = False
-    candidates = discover_candidates(
-        prefer=prefer, cfg=cfg, app_id=app_id, allow_lan_scan=False
-    )
-    # Always try named candidates first; if all fail, optional /24 scan
+    candidates = discover_candidates(prefer=prefer, cfg=cfg, exclude=exclude)
     for label, ip in candidates:
         ok = probe_connect(ip, app_id)
         if not quiet:
             print(f"  probe {label} -> {ip}: {'OK' if ok else 'fail'}", file=sys.stderr)
         if ok:
-            return {"ip": ip, "host": label if not _is_ip(label) and not label.startswith("lan-scan:") else ""}
-
+            host = ""
+            if not _is_ip(label) and not label.startswith("lan-scan:"):
+                host = label
+            return {"ip": ip, "host": host}
     if allow_lan_scan:
         if not quiet:
-            print("  named candidates failed; scanning local /24 for S40 API…", file=sys.stderr)
+            print("  named candidates failed; scanning local /24 (opt-in)…", file=sys.stderr)
         for label, ip in _scan_lan_lennox(app_id):
-            # scan already probed Connect; trust result
+            if exclude and ip in exclude:
+                continue
             if not quiet:
                 print(f"  probe {label} -> {ip}: OK", file=sys.stderr)
             return {"ip": ip, "host": ""}
-
-    if not quiet and not candidates:
-        print(
-            "No discovery candidates (mDNS empty, no config host; LAN scan found none).",
-            file=sys.stderr,
-        )
     return None
 
 
-def _is_ip(s: str) -> bool:
-    return all(p.isdigit() for p in s.split(".")) and s.count(".") == 3
-
-
-def effective_app_id(args, cfg: dict[str, Any]) -> str:
-    # CLI --app-id if not the library default and user overrode via env or flag
-    # argparse always passes something; prefer: explicit env > config > flag default
-    if ENV_APP_ID:
-        return ENV_APP_ID
-    if cfg.get("app_id"):
-        return str(cfg["app_id"])
-    return getattr(args, "app_id", None) or DEFAULT_APP_ID
-
-
-def remember_success(
+def remember_identity(
     cfg: dict[str, Any],
     *,
     ip: str,
     app_id: str,
     host: str = "",
     serial: Optional[str] = None,
+    clear_host: bool = False,
+    product: Optional[str] = None,
 ) -> dict[str, Any]:
     cfg = dict(cfg)
     cfg["ip"] = ip
-    if host:
-        cfg["host"] = host
     cfg["app_id"] = app_id
+    if clear_host:
+        cfg.pop("host", None)
+    elif host:
+        cfg["host"] = host
     if serial:
         cfg["serial"] = serial
+    if product:
+        cfg["product"] = product
     cfg["last_ok_at"] = _utc_now()
     save_config(cfg)
     return cfg
 
 
 def resolve_target(args) -> tuple[str, str, dict[str, Any]]:
-    """
-    Resolve (ip, app_id, cfg) with probe + auto rediscover.
-
-    Order: --ip → LENNOX_IP → config → discover.
-    If first choice fails Connect and rediscover allowed, scan and update config.
-    """
+    """Resolve (ip, app_id, cfg). Does NOT persist until session proves identity."""
     cfg = load_config()
     app_id = effective_app_id(args, cfg)
+    # reload if generate mutated config
+    cfg = load_config()
     explicit_ip = (getattr(args, "ip", None) or "").strip() or None
-    # argparse may set ip from None; treat empty as unset
     rediscover = not getattr(args, "no_rediscover", False)
-    allow_lan = not getattr(args, "no_lan_scan", False) and not ENV_NO_LAN_SCAN
+    # LAN scan opt-in only (--lan-scan)
+    allow_lan = bool(getattr(args, "lan_scan", False)) and not ENV_NO_LAN_SCAN
 
-    primary_label: Optional[str] = None
+    primary: Optional[str] = None
     if explicit_ip:
-        primary_label = explicit_ip
-    elif ENV_IP:
-        primary_label = ENV_IP
+        primary = explicit_ip
+    elif env_ip():
+        primary = env_ip()
     elif (cfg.get("ip") or "").strip():
-        primary_label = str(cfg["ip"]).strip()
+        primary = str(cfg["ip"]).strip()
     elif (cfg.get("host") or "").strip():
-        primary_label = str(cfg["host"]).strip()
+        primary = str(cfg["host"]).strip()
 
-    if primary_label:
+    if primary:
         try:
-            ip = resolve_host(primary_label)
+            ip = resolve_host(primary)
         except SystemExit as e:
             if not rediscover:
                 raise
@@ -368,46 +513,45 @@ def resolve_target(args) -> tuple[str, str, dict[str, Any]]:
             ip = ""
         else:
             if probe_connect(ip, app_id):
-                host = primary_label if not _is_ip(primary_label) else (cfg.get("host") or "")
-                cfg = remember_success(cfg, ip=ip, app_id=app_id, host=host or "")
                 return ip, app_id, cfg
             if not rediscover:
-                raise SystemExit(
-                    f"Connect failed for {ip} (app_id={app_id}). "
-                    "Fix LENNOX_IP / --ip or omit --no-rediscover."
+                raise CliError(
+                    EX_NOT_FOUND,
+                    f"Connect failed for {ip}. Fix --ip / LENNOX_IP or omit --no-rediscover.",
                 )
-            print(
-                f"lennox-s40: Connect failed for {ip}; rediscovering…",
-                file=sys.stderr,
+            print(f"lennox-s40: Connect failed for {ip}; rediscovering…", file=sys.stderr)
+            found = discover_live(
+                app_id,
+                prefer=None,
+                cfg=cfg,
+                allow_lan_scan=allow_lan,
+                exclude={ip},
             )
+            if not found:
+                raise CliError(EX_NOT_FOUND, f"No reachable S40 after failing {ip}")
+            print(f"lennox-s40: using {found['ip']}", file=sys.stderr)
+            return found["ip"], app_id, cfg
     elif not rediscover:
-        # No address known and auto-discover disabled — fail closed (hermetic / offline).
-        raise SystemExit(
-            "No thermostat address. Set --ip, LENNOX_IP, run: lennox-s40 discover\n"
-            f"(or omit --no-rediscover to scan LAN)\nConfig path: {config_path()}"
+        raise CliError(
+            EX_NOT_FOUND,
+            f"No thermostat address. Set --ip, LENNOX_IP, or run discover. Config: {config_path()}",
         )
 
-    # Full discover (no primary with rediscover allowed, or primary failed + rediscover)
     found = discover_live(
         app_id,
-        prefer=primary_label,
+        prefer=primary,
         cfg=cfg,
-        quiet=False,
         allow_lan_scan=allow_lan,
     )
     if not found:
-        raise SystemExit(
-            "No reachable S40. Ensure same LAN, then: lennox-s40 discover\n"
-            f"Config path: {config_path()}"
-        )
-    ip = found["ip"]
-    host = found.get("host") or ""
-    cfg = remember_success(cfg, ip=ip, app_id=app_id, host=host)
-    print(f"lennox-s40: using {ip}" + (f" ({host})" if host else ""), file=sys.stderr)
-    return ip, app_id, cfg
+        raise CliError(EX_NOT_FOUND, f"No reachable S40. Config: {config_path()}")
+    print(f"lennox-s40: using {found['ip']}", file=sys.stderr)
+    return found["ip"], app_id, cfg
 
 
-async def connect(ip: str, app_id: str) -> s30api_async:
+async def connect(ip: str, app_id: str):
+    _load_api()
+    assert s30api_async is not None
     api = s30api_async(
         username="",
         password="",
@@ -423,14 +567,18 @@ async def connect(ip: str, app_id: str) -> s30api_async:
     return api
 
 
-async def pump_until_ready(api: s30api_async):
+async def pump_until_ready(api, deadline: float = SESSION_DEADLINE):
     system = api.getSystem("LCC")
     await api.subscribe(system)
-    for i in range(POLL_MAX):
+    start = time.monotonic()
+    i = 0
+    while time.monotonic() - start < deadline and i < POLL_MAX:
+        i += 1
         try:
             await api.messagePump()
         except Exception:
-            if i % 15 == 0:
+            await asyncio.sleep(min(2.0, 0.2 * i))
+            if i % 5 == 0:
                 try:
                     await api.serverConnect()
                     await api.subscribe(system)
@@ -439,59 +587,131 @@ async def pump_until_ready(api: s30api_async):
             continue
         active = [z for z in system.zone_list if getattr(z, "temperature", None) is not None]
         if system.name and active:
-            return system
-    return system
+            return system, True
+    return system, False
 
 
 @asynccontextmanager
 async def session(args):
-    """Resolve target (with rediscover), connect, yield (api, system, cfg); remember serial."""
+    """Full session with reconnect+rediscover once on connect failure."""
+    rediscover = not getattr(args, "no_rediscover", False)
+    allow_lan = bool(getattr(args, "lan_scan", False)) and not ENV_NO_LAN_SCAN
+    explicit_ip = (getattr(args, "ip", None) or "").strip() or None
+
     ip, app_id, cfg = resolve_target(args)
-    api = await connect(ip, app_id)
+    api = None
     try:
-        system = await pump_until_ready(api)
-        serial = getattr(system, "serialNumber", None)
-        if serial or system.wifi_ip:
-            # Prefer wifi_ip from unit if present
-            unit_ip = getattr(system, "wifi_ip", None) or ip
-            cfg = remember_success(
-                cfg,
-                ip=unit_ip,
-                app_id=app_id,
-                host=cfg.get("host") or "",
-                serial=serial,
-            )
-        yield api, system, cfg
-    finally:
         try:
-            await api.shutdown()
-        except Exception:
-            pass
+            api = await connect(ip, app_id)
+            system, ready = await pump_until_ready(api)
+        except Exception as e:
+            if not rediscover:
+                raise CliError(EX_DEVICE, f"session failed: {e}") from e
+            print(f"lennox-s40: session failed ({e}); rediscovering…", file=sys.stderr)
+            if api is not None:
+                try:
+                    await api.shutdown()
+                except Exception:
+                    pass
+            found = discover_live(
+                app_id,
+                cfg=cfg,
+                allow_lan_scan=allow_lan,
+                exclude={ip},
+            )
+            if not found:
+                raise CliError(EX_NOT_FOUND, f"No reachable S40 after session fail on {ip}") from e
+            ip = found["ip"]
+            api = await connect(ip, app_id)
+            system, ready = await pump_until_ready(api)
+
+        if not ready and getattr(args, "cmd", None) != "status":
+            # writes require ready; status may return degraded with flag
+            if getattr(args, "require_ready", True) and getattr(args, "cmd", "") not in {
+                "status",
+                None,
+            }:
+                raise CliError(EX_TIMEOUT, "system not ready (no active zones within deadline)")
+
+        serial = getattr(system, "serialNumber", None)
+        product = getattr(system, "productType", None)
+        # Identity: if explicit IP, clear stale host unless it matches this unit's serial
+        clear_host = bool(explicit_ip)
+        host = ""
+        if not clear_host:
+            host = (cfg.get("host") or "") if not explicit_ip else ""
+        if serial:
+            host = f"Lennox-S40-{serial}.local"
+            clear_host = False
+        cfg = remember_identity(
+            cfg,
+            ip=ip,
+            app_id=app_id,
+            host=host,
+            serial=serial,
+            clear_host=clear_host and not serial,
+            product=product,
+        )
+        yield api, system, cfg, ready
+    finally:
+        if api is not None:
+            try:
+                await api.shutdown()
+            except Exception:
+                pass
 
 
-def pick_zone(system, zone_arg: Optional[str]):
+def pick_zone(system, zone_arg: Optional[str], *, first_zone: bool = False, for_write: bool = False):
     zones = list(system.zone_list)
     active = [z for z in zones if getattr(z, "temperature", None) is not None]
     if not zones:
-        raise SystemExit("No zones discovered yet")
+        raise CliError(EX_DEVICE, "No zones discovered yet")
     if zone_arg is None:
+        if for_write and len(active) > 1 and not first_zone:
+            names = ", ".join(getattr(z, "name", "?") or "?" for z in active)
+            raise CliError(
+                EX_BAD_REQ,
+                f"Multiple active zones ({names}); pass --zone NAME or --first-zone",
+            )
         if not active:
-            raise SystemExit("No active zones with temperature data")
+            raise CliError(EX_DEVICE, "No active zones with temperature data")
         return active[0]
     if zone_arg.isdigit():
         zid = int(zone_arg)
         for z in zones:
             if getattr(z, "id", None) == zid:
+                if for_write and getattr(z, "temperature", None) is None:
+                    raise CliError(EX_BAD_REQ, f"Zone id={zid} is inactive")
                 return z
-        raise SystemExit(f"No zone with id={zid}")
+        raise CliError(EX_BAD_REQ, f"No zone with id={zid}")
     needle = zone_arg.lower()
-    for z in zones:
-        if (getattr(z, "name", None) or "").lower() == needle:
-            return z
-    for z in zones:
-        if needle in (getattr(z, "name", None) or "").lower():
-            return z
-    raise SystemExit(f"No zone matching {zone_arg!r}")
+    exact = [z for z in zones if (getattr(z, "name", None) or "").lower() == needle]
+    if len(exact) == 1:
+        z = exact[0]
+        if for_write and getattr(z, "temperature", None) is None:
+            raise CliError(EX_BAD_REQ, f"Zone {zone_arg!r} is inactive")
+        return z
+    if len(exact) > 1:
+        raise CliError(EX_BAD_REQ, f"Ambiguous zone name {zone_arg!r}")
+    partial = [z for z in zones if needle in (getattr(z, "name", None) or "").lower()]
+    if for_write:
+        raise CliError(EX_BAD_REQ, f"No exact zone match for {zone_arg!r} (substring match disabled for writes)")
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        raise CliError(EX_BAD_REQ, f"Ambiguous zone substring {zone_arg!r}")
+    raise CliError(EX_BAD_REQ, f"No zone matching {zone_arg!r}")
+
+
+def _zone_hold(z) -> Optional[bool]:
+    v = getattr(z, "scheduleHold", None)
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in {"true", "1", "yes"}
+    return bool(v)
 
 
 def zone_dict(z) -> dict:
@@ -506,27 +726,43 @@ def zone_dict(z) -> dict:
         "single_setpoint_F": getattr(z, "sp", None),
         "fan": getattr(z, "fanMode", None),
         "humidity_mode": getattr(z, "humidityMode", None),
+        "schedule_hold": _zone_hold(z),
+        "override_active": getattr(z, "overrideActive", None)
+        if hasattr(z, "overrideActive")
+        else getattr(z, "isZoneOveride", lambda: None)()
+        if callable(getattr(z, "isZoneOveride", None))
+        else None,
         "active": getattr(z, "temperature", None) is not None,
     }
 
 
-def system_dict(system) -> dict:
+def system_dict(system, *, full: bool = False) -> dict:
+    serial = getattr(system, "serialNumber", None)
+    ssid = getattr(system, "wifi_ssid", None)
+    wip = getattr(system, "wifi_ip", None)
+    if not full:
+        if serial and len(str(serial)) > 4:
+            serial = "…" + str(serial)[-4:]
+        if ssid:
+            ssid = "<redacted>"
+        if wip:
+            wip = "<redacted>"
     return {
-        "name": system.name,
-        "product": system.productType,
-        "serial": system.serialNumber,
-        "software": system.softwareVersion,
-        "outdoor_temp_F": system.outdoorTemperature,
-        "indoor_unit": system.indoorUnitType,
-        "outdoor_unit": system.outdoorUnitType,
-        "manual_away": system.manualAwayMode,
-        "wifi_ip": system.wifi_ip,
-        "wifi_ssid": system.wifi_ssid,
-        "wifi_rssi": system.wifi_rssi,
-        "alert": system.alert,
-        "temp_unit": system.temperatureUnit,
-        "single_setpoint_mode": system.single_setpoint_mode,
-        "zones": [zone_dict(z) for z in system.zone_list],
+        "name": getattr(system, "name", None),
+        "product": getattr(system, "productType", None),
+        "serial": serial,
+        "software": getattr(system, "softwareVersion", None),
+        "outdoor_temp_F": getattr(system, "outdoorTemperature", None),
+        "indoor_unit": getattr(system, "indoorUnitType", None),
+        "outdoor_unit": getattr(system, "outdoorUnitType", None),
+        "manual_away": getattr(system, "manualAwayMode", None),
+        "wifi_ip": wip,
+        "wifi_ssid": ssid,
+        "wifi_rssi": getattr(system, "wifi_rssi", None) if full else None,
+        "alert": getattr(system, "alert", None),
+        "temp_unit": getattr(system, "temperatureUnit", None),
+        "single_setpoint_mode": getattr(system, "single_setpoint_mode", None),
+        "zones": [zone_dict(z) for z in getattr(system, "zone_list", []) or []],
     }
 
 
@@ -541,201 +777,387 @@ MODE_MAP = {
 }
 
 
+def _finite_temp(v: float, label: str) -> float:
+    try:
+        x = float(v)
+    except (TypeError, ValueError) as e:
+        raise CliError(EX_BAD_REQ, f"invalid {label}") from e
+    if not math.isfinite(x):
+        raise CliError(EX_BAD_REQ, f"{label} must be finite")
+    if x < 40 or x > 99:
+        raise CliError(EX_BAD_REQ, f"{label} out of range (40–99 °F)")
+    return x
+
+
+async def _pump_n(api, n: int = 8) -> None:
+    for _ in range(n):
+        try:
+            await api.messagePump()
+        except Exception:
+            pass
+
+
+async def _verify_zone(api, z, predicate, timeout: float = 15.0) -> bool:
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        try:
+            await api.messagePump()
+        except Exception:
+            await asyncio.sleep(0.3)
+            continue
+        if predicate(z):
+            return True
+    return False
+
+
 async def cmd_status(args) -> int:
-    async with session(args) as (_api, system, _cfg):
-        print(json.dumps(system_dict(system), indent=2))
-    return 0
+    async with session(args) as (_api, system, _cfg, ready):
+        out = system_dict(system, full=bool(getattr(args, "full", False) or ENV_FULL))
+        out["ready"] = ready
+        print(json.dumps(out, indent=2))
+        if not ready:
+            return EX_TIMEOUT
+    return EX_OK
 
 
 async def cmd_mode(args) -> int:
     mode = MODE_MAP.get(args.mode.lower())
     if mode is None:
-        raise SystemExit(f"Unknown mode {args.mode!r}; use off|cool|heat|auto")
-    async with session(args) as (api, system, _cfg):
-        z = pick_zone(system, args.zone)
+        raise CliError(EX_BAD_REQ, f"Unknown mode {args.mode!r}; use off|cool|heat|auto")
+    async with session(args) as (api, system, _cfg, ready):
+        if not ready:
+            raise CliError(EX_TIMEOUT, "system not ready")
+        z = pick_zone(system, args.zone, first_zone=args.first_zone, for_write=True)
+        print(f"lennox-s40: target zone {getattr(z, 'name', z.id)!r}", file=sys.stderr)
         await z.setHVACMode(mode)
-        for _ in range(5):
-            await api.messagePump()
-        print(json.dumps({"ok": True, "zone": zone_dict(z), "mode": mode}, indent=2))
-    return 0
+        ok = await _verify_zone(api, z, lambda zz: getattr(zz, "systemMode", None) == mode)
+        print(
+            json.dumps(
+                {"ok": ok, "verified": ok, "mode": mode, "zone": zone_dict(z)},
+                indent=2,
+            )
+        )
+        return EX_OK if ok else EX_TIMEOUT
 
 
 async def cmd_cool(args) -> int:
-    async with session(args) as (api, system, _cfg):
-        z = pick_zone(system, args.zone)
-        await z.perform_setpoint(r_csp=float(args.temp_f))
-        for _ in range(5):
-            await api.messagePump()
-        print(json.dumps({"ok": True, "zone": zone_dict(z)}, indent=2))
-    return 0
+    temp = _finite_temp(args.temp_f, "cool setpoint")
+    async with session(args) as (api, system, _cfg, ready):
+        if not ready:
+            raise CliError(EX_TIMEOUT, "system not ready")
+        z = pick_zone(system, args.zone, first_zone=args.first_zone, for_write=True)
+        print(f"lennox-s40: target zone {getattr(z, 'name', z.id)!r}", file=sys.stderr)
+        hold_before = _zone_hold(z)
+        ssp = bool(getattr(system, "single_setpoint_mode", False))
+        if ssp:
+            await z.perform_setpoint(r_sp=temp)
+            pred = lambda zz: getattr(zz, "sp", None) == temp
+        else:
+            await z.perform_setpoint(r_csp=temp)
+            pred = lambda zz: getattr(zz, "csp", None) == temp
+        ok = await _verify_zone(api, z, pred)
+        hold_after = _zone_hold(z)
+        print(
+            json.dumps(
+                {
+                    "ok": ok,
+                    "verified": ok,
+                    "zone": zone_dict(z),
+                    "schedule_hold_created": bool(hold_after and not hold_before),
+                    "single_setpoint_mode": ssp,
+                },
+                indent=2,
+            )
+        )
+        return EX_OK if ok else EX_TIMEOUT
 
 
 async def cmd_heat(args) -> int:
-    async with session(args) as (api, system, _cfg):
-        z = pick_zone(system, args.zone)
-        await z.perform_setpoint(r_hsp=float(args.temp_f))
-        for _ in range(5):
-            await api.messagePump()
-        print(json.dumps({"ok": True, "zone": zone_dict(z)}, indent=2))
-    return 0
+    temp = _finite_temp(args.temp_f, "heat setpoint")
+    async with session(args) as (api, system, _cfg, ready):
+        if not ready:
+            raise CliError(EX_TIMEOUT, "system not ready")
+        z = pick_zone(system, args.zone, first_zone=args.first_zone, for_write=True)
+        print(f"lennox-s40: target zone {getattr(z, 'name', z.id)!r}", file=sys.stderr)
+        hold_before = _zone_hold(z)
+        ssp = bool(getattr(system, "single_setpoint_mode", False))
+        if ssp:
+            await z.perform_setpoint(r_sp=temp)
+            pred = lambda zz: getattr(zz, "sp", None) == temp
+        else:
+            await z.perform_setpoint(r_hsp=temp)
+            pred = lambda zz: getattr(zz, "hsp", None) == temp
+        ok = await _verify_zone(api, z, pred)
+        hold_after = _zone_hold(z)
+        print(
+            json.dumps(
+                {
+                    "ok": ok,
+                    "verified": ok,
+                    "zone": zone_dict(z),
+                    "schedule_hold_created": bool(hold_after and not hold_before),
+                    "single_setpoint_mode": ssp,
+                },
+                indent=2,
+            )
+        )
+        return EX_OK if ok else EX_TIMEOUT
 
 
 async def cmd_fan(args) -> int:
     fan = args.fan.lower()
     if fan not in {"auto", "on", "circulate"}:
-        raise SystemExit("fan must be auto|on|circulate")
-    async with session(args) as (api, system, _cfg):
-        z = pick_zone(system, args.zone)
+        raise CliError(EX_BAD_REQ, "fan must be auto|on|circulate")
+    async with session(args) as (api, system, _cfg, ready):
+        if not ready:
+            raise CliError(EX_TIMEOUT, "system not ready")
+        z = pick_zone(system, args.zone, first_zone=args.first_zone, for_write=True)
+        print(f"lennox-s40: target zone {getattr(z, 'name', z.id)!r}", file=sys.stderr)
         await z.setFanMode(fan)
-        for _ in range(5):
-            await api.messagePump()
-        print(json.dumps({"ok": True, "zone": zone_dict(z), "fan": fan}, indent=2))
-    return 0
+        ok = await _verify_zone(api, z, lambda zz: getattr(zz, "fanMode", None) == fan)
+        print(json.dumps({"ok": ok, "verified": ok, "fan": fan, "zone": zone_dict(z)}, indent=2))
+        return EX_OK if ok else EX_TIMEOUT
 
 
 async def cmd_away(args) -> int:
-    on = args.state.lower() in {"on", "1", "true", "yes"}
-    async with session(args) as (api, system, _cfg):
+    state = args.state.lower()
+    if state not in {"on", "off"}:
+        raise CliError(EX_BAD_REQ, "away must be on|off")
+    on = state == "on"
+    async with session(args) as (api, system, _cfg, ready):
+        if not ready:
+            raise CliError(EX_TIMEOUT, "system not ready")
         await system.setManualAwayMode(on)
-        for _ in range(5):
-            await api.messagePump()
-        print(json.dumps({"ok": True, "manual_away": system.manualAwayMode}, indent=2))
-    return 0
+        ok = await _verify_zone(
+            api, system, lambda s: bool(getattr(s, "manualAwayMode", None)) is on, timeout=15.0
+        )
+        # _verify_zone expects zone-like; use manual pump
+        await _pump_n(api, 8)
+        ok = bool(getattr(system, "manualAwayMode", None)) is on
+        print(json.dumps({"ok": ok, "verified": ok, "manual_away": system.manualAwayMode}, indent=2))
+        return EX_OK if ok else EX_TIMEOUT
+
+
+async def cmd_hold(args) -> int:
+    state = args.state.lower()
+    if state not in {"on", "off", "status"}:
+        raise CliError(EX_BAD_REQ, "hold must be on|off|status")
+    async with session(args) as (api, system, _cfg, ready):
+        if not ready:
+            raise CliError(EX_TIMEOUT, "system not ready")
+        z = pick_zone(
+            system,
+            args.zone,
+            first_zone=args.first_zone or state == "status",
+            for_write=state != "status",
+        )
+        if state == "status":
+            print(json.dumps({"zone": zone_dict(z), "schedule_hold": _zone_hold(z)}, indent=2))
+            return EX_OK
+        hold = state == "on"
+        if not hasattr(z, "setScheduleHold"):
+            raise CliError(EX_DEVICE, "setScheduleHold not available on this firmware/API")
+        await z.setScheduleHold(hold)
+        await _pump_n(api, 8)
+        print(
+            json.dumps(
+                {"ok": True, "schedule_hold": _zone_hold(z), "zone": zone_dict(z)},
+                indent=2,
+            )
+        )
+        return EX_OK
 
 
 def cmd_discover(args) -> int:
-    """mDNS + Connect probe; persist first success to running config."""
     cfg = load_config()
     app_id = effective_app_id(args, cfg)
+    cfg = load_config()
     print(f"config: {config_path()}")
-    print("S40 mDNS: Lennox-S40-<SERIAL>.local  (_http._tcp / _icomfort4)")
-    print(f"probe: POST https://<ip>/Endpoints/{app_id}/Connect  → 200/204")
+    print(f"probe: POST https://<ip>/Endpoints/{app_id}/Connect (+ CN=Lennox preferred)")
     print()
-
     prefer = (getattr(args, "ip", None) or "").strip() or None
+    allow_lan = bool(getattr(args, "lan_scan", False)) and not ENV_NO_LAN_SCAN
     found_any = False
     first: Optional[dict[str, str]] = None
-    # Prefer named + mDNS; print all; fall back to LAN scan if none good
-    candidates = discover_candidates(
-        prefer=prefer, cfg=cfg, app_id=app_id, allow_lan_scan=False
-    )
-    for label, ip in candidates:
+    for label, ip in discover_candidates(prefer=prefer, cfg=cfg):
         ok = probe_connect(ip, app_id)
-        mark = "GOOD" if ok else "fail"
-        print(f"  {label} -> {ip}: Connect {mark}")
-        if ok:
+        print(f"  {label} -> {ip}: {'GOOD' if ok else 'fail'}")
+        if ok and first is None:
             found_any = True
-            if first is None:
-                host = label if (not _is_ip(label) and not label.startswith("lan-scan:")) else ""
-                first = {"ip": ip, "host": host}
-    if not first and not getattr(args, "no_lan_scan", False) and not ENV_NO_LAN_SCAN:
-        print("  scanning local /24 for S40 Connect…")
+            host = label if (not _is_ip(label) and not label.startswith("lan-scan:")) else ""
+            first = {"ip": ip, "host": host}
+    if not first and allow_lan:
+        print("  scanning local /24 (opt-in)…")
         for label, ip in _scan_lan_lennox(app_id):
-            print(f"  {label} -> {ip}: Connect GOOD")
+            print(f"  {label} -> {ip}: GOOD")
             found_any = True
             first = {"ip": ip, "host": ""}
             break
     if first:
-        cfg = remember_success(
-            cfg,
-            ip=first["ip"],
-            app_id=app_id,
-            host=first.get("host") or "",
-        )
+        # Persist only after optional full session if --verify-session
+        if getattr(args, "verify_session", False):
+            async def _verify():
+                api = await connect(first["ip"], app_id)
+                try:
+                    system, ready = await pump_until_ready(api)
+                    if not ready:
+                        raise CliError(EX_TIMEOUT, "discovered but system not ready")
+                    return remember_identity(
+                        cfg,
+                        ip=first["ip"],
+                        app_id=app_id,
+                        host=first.get("host") or "",
+                        serial=getattr(system, "serialNumber", None),
+                        product=getattr(system, "productType", None),
+                    )
+                finally:
+                    await api.shutdown()
+
+            asyncio.run(_verify())
+        else:
+            # still require CN probe already done; persist probe-level for ops convenience
+            # but mark as unverified_session
+            cfg2 = remember_identity(
+                cfg,
+                ip=first["ip"],
+                app_id=app_id,
+                host=first.get("host") or "",
+            )
+            cfg2["session_verified"] = False
+            save_config(cfg2)
         print()
         print(f"saved config: ip={first['ip']} app_id={app_id}")
         print(f"  path: {config_path()}")
-        print(f"export LENNOX_IP={first['ip']}")
-    return 0 if found_any else 1
+    return EX_OK if found_any else EX_NOT_FOUND
 
 
 def cmd_config(args) -> int:
     path = config_path()
-    sub = getattr(args, "config_cmd", "show")
+    sub = getattr(args, "config_cmd", "show") or "show"
     if sub == "path":
         print(path)
-        return 0
+        return EX_OK
     if sub == "clear":
-        if os.path.isfile(path):
-            os.remove(path)
-            print(f"removed {path}")
-        else:
-            print(f"no config at {path}")
-        return 0
-    # show
+        with config_lock():
+            if os.path.isfile(path):
+                os.remove(path)
+                print(f"removed {path}")
+            else:
+                print(f"no config at {path}")
+        return EX_OK
     cfg = load_config()
     print(json.dumps({"path": path, "config": cfg}, indent=2))
-    return 0
+    return EX_OK
+
+
+def cmd_version(_args) -> int:
+    print(VERSION)
+    return EX_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lennox-s40", description="Lennox S40 local LAN control")
+    p.add_argument("--ip", default=None, help="thermostat IP or mDNS name")
+    p.add_argument("--app-id", default=None, help="unique client application id")
+    p.add_argument("--no-rediscover", action="store_true")
     p.add_argument(
-        "--ip",
-        default=None,
-        help="thermostat IP or mDNS name (else LENNOX_IP, config, then discover)",
-    )
-    p.add_argument(
-        "--app-id",
-        default=DEFAULT_APP_ID,
-        help="unique client application id",
-    )
-    p.add_argument(
-        "--no-rediscover",
+        "--lan-scan",
         action="store_true",
-        help="do not auto-discover if last-known IP fails",
+        help="opt-in /24 Connect sweep (default off)",
     )
-    p.add_argument(
-        "--no-lan-scan",
-        action="store_true",
-        help="skip local /24 Connect sweep during discovery",
-    )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("--no-lan-scan", action="store_true", help="legacy alias: force off")
+    p.add_argument("--full", action="store_true", help="do not redact SSID/serial/IP in status")
+    p.add_argument("--first-zone", action="store_true", help="allow default first zone on writes")
+    p.add_argument("--version", action="store_true", help="print version and exit")
+    sub = p.add_subparsers(dest="cmd")
 
-    s = sub.add_parser("status", help="read system + zone state")
+    s = sub.add_parser("status")
     s.set_defaults(func=lambda a: asyncio.run(cmd_status(a)))
 
-    s = sub.add_parser("mode", help="set HVAC mode")
-    s.add_argument("mode", help="off|cool|heat|auto")
-    s.add_argument("--zone", help="zone id or name (default: first active)")
+    s = sub.add_parser("mode")
+    s.add_argument("mode", choices=["off", "cool", "heat", "auto", "heat_cool", "heat-cool"])
+    s.add_argument("--zone")
     s.set_defaults(func=lambda a: asyncio.run(cmd_mode(a)))
 
-    s = sub.add_parser("cool", help="set cool setpoint °F")
+    s = sub.add_parser("cool")
     s.add_argument("temp_f", type=float)
-    s.add_argument("--zone", help="zone id or name")
+    s.add_argument("--zone")
     s.set_defaults(func=lambda a: asyncio.run(cmd_cool(a)))
 
-    s = sub.add_parser("heat", help="set heat setpoint °F")
+    s = sub.add_parser("heat")
     s.add_argument("temp_f", type=float)
-    s.add_argument("--zone", help="zone id or name")
+    s.add_argument("--zone")
     s.set_defaults(func=lambda a: asyncio.run(cmd_heat(a)))
 
-    s = sub.add_parser("fan", help="set fan mode")
-    s.add_argument("fan", help="auto|on|circulate")
-    s.add_argument("--zone", help="zone id or name")
+    s = sub.add_parser("fan")
+    s.add_argument("fan", choices=["auto", "on", "circulate"])
+    s.add_argument("--zone")
     s.set_defaults(func=lambda a: asyncio.run(cmd_fan(a)))
 
-    s = sub.add_parser("away", help="manual away mode")
-    s.add_argument("state", help="on|off")
+    s = sub.add_parser("away")
+    s.add_argument("state", choices=["on", "off"])
     s.set_defaults(func=lambda a: asyncio.run(cmd_away(a)))
 
-    s = sub.add_parser("discover", help="probe LAN; save first good IP to config")
+    s = sub.add_parser("hold")
+    s.add_argument("state", choices=["on", "off", "status"])
+    s.add_argument("--zone")
+    s.set_defaults(func=lambda a: asyncio.run(cmd_hold(a)))
+
+    s = sub.add_parser("discover")
+    s.add_argument(
+        "--verify-session",
+        action="store_true",
+        help="full subscribe before saving config",
+    )
     s.set_defaults(func=cmd_discover)
 
-    s = sub.add_parser("config", help="show/path/clear running config")
+    s = sub.add_parser("config")
     cs = s.add_subparsers(dest="config_cmd")
-    cs.add_parser("show", help="print config JSON (default)").set_defaults(config_cmd="show")
-    cs.add_parser("path", help="print config file path").set_defaults(config_cmd="path")
-    cs.add_parser("clear", help="delete config file").set_defaults(config_cmd="clear")
+    for name in ("show", "path", "clear"):
+        cs.add_parser(name).set_defaults(config_cmd=name)
     s.set_defaults(func=cmd_config, config_cmd="show")
+
+    s = sub.add_parser("version")
+    s.set_defaults(func=cmd_version)
 
     return p
 
 
 def main(argv=None) -> int:
+    # honor legacy --no-lan-scan by mapping to not lan_scan
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
-    args = parser.parse_args(argv)
-    return args.func(args) or 0
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return int(e.code) if e.code is not None else 1
+
+    if getattr(args, "version", False) and not args.cmd:
+        return cmd_version(args)
+
+    if not args.cmd:
+        parser.print_help()
+        return EX_BAD_REQ
+
+    # legacy flag: --no-lan-scan means do not enable scan
+    if getattr(args, "no_lan_scan", False):
+        args.lan_scan = False
+
+    try:
+        return int(args.func(args) or 0)
+    except CliError as e:
+        return int(e.code)
+    except SystemExit as e:
+        if isinstance(e.code, int):
+            return e.code
+        return EX_NOT_FOUND
+    except Exception as e:
+        name = type(e).__name__
+        if name == "S30Exception" or "S30" in name:
+            print(f"lennox-s40: device error: {e}", file=sys.stderr)
+            return EX_DEVICE
+        print(f"lennox-s40: unexpected error: {e}", file=sys.stderr)
+        return EX_DEVICE
 
 
 if __name__ == "__main__":

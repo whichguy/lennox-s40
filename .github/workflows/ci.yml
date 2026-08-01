@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev deps
+        run: |
+          python -m pip install -U pip
+          pip install -e ".[dev]" 2>/dev/null || pip install pytest ruff
+      - name: Ruff
+        run: ruff check skills/lennox-s40/scripts/lennox_s40.py tests || true
+      - name: Shell scripts executable + bash -n
+        run: |
+          bash -n install.sh
+          bash -n skills/lennox-s40/scripts/lennox-s40
+          bash -n test/lennox-s40.test.sh
+          bash -n test/install.test.sh
+      - name: Hermetic shell package tests
+        run: bash test/lennox-s40.test.sh
+      - name: Installer contract tests
+        run: bash test/install.test.sh
+      - name: Pytest unit tests
+        run: pytest tests
+      - name: Version parity
+        run: |
+          py_ver=$(python -c "import re,pathlib; t=pathlib.Path('skills/lennox-s40/scripts/lennox_s40.py').read_text(); print(re.search(r'VERSION = \"([^\"]+)\"', t).group(1))")
+          skill_ver=$(python -c "import re,pathlib; t=pathlib.Path('skills/lennox-s40/SKILL.md').read_text(); print(re.search(r'^version:\s*(\S+)', t, re.M).group(1))")
+          plugin_ver=$(python -c "import json; print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+          echo "py=$py_ver skill=$skill_ver plugin=$plugin_ver"
+          test "$py_ver" = "$skill_ver"
+          test "$py_ver" = "$plugin_ver"

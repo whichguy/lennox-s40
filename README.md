@@ -78,6 +78,19 @@ Claude pins the **plugin root** of this repo (directory that contains `.claude-p
 
 Until the GitHub remote exists, use skill-dir `./install.sh` only.
 
+## Threat model
+
+Local unauthenticated control of HVAC on a trusted LAN. See [SECURITY.md](SECURITY.md) and `skills/lennox-s40/references/ops.md`.
+
+## Tests
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install pytest ruff
+PYTHONPATH=skills/lennox-s40/scripts .venv/bin/pytest tests -q
+bash test/lennox-s40.test.sh
+bash test/install.test.sh
+```
+
 ## License
 
 MIT

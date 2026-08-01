@@ -6,3 +6,9 @@ venv/
 *.log
 .results/
 results/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv

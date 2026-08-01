@@ -5,7 +5,7 @@ description: >-
   read status, set mode/setpoints/fan/away. Use when the user mentions home AC,
   heat, thermostat, Lennox Home, S40 zones, or HVAC setpoints. Local HTTPS only
   (no Lennox cloud). Requires LAN reachability and one-time scripts/lennox-s40 --setup.
-version: 0.1.0
+version: 0.2.0
 license: MIT
 platforms:
   - linux
@@ -66,10 +66,13 @@ bash scripts/lennox-s40 config show
 | `discover` | mDNS + Connect probe; **persist** first good IP to config |
 | `status` | JSON system + zones; updates config on success |
 | `mode` / `cool` / `heat` / `fan` / `away` | control (same resolve path) |
+| `hold on\|off\|status` | schedule hold (report/clear) |
 | `config show\|path\|clear` | inspect or wipe running config |
 
 **Resolve order:** `--ip` → `LENNOX_IP` → config → discover.  
-**Stale IP:** Connect fail → rediscover → save → retry (disable with `--no-rediscover`).
+**Stale IP:** Connect/session fail → rediscover (exclude bad IP) → retry (`--no-rediscover` to disable).
+**LAN /24 scan:** opt-in via `--lan-scan` (default off).
+**App id:** unique install-scoped id auto-generated (not shared library default).
 
 Exit codes: `0` ok · `1` soft failure (discover miss) · `2` missing deps.
 
