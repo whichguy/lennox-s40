@@ -54,12 +54,11 @@ def _load_api() -> None:
         _IMPORT_ERR = None
     except ImportError as e:
         _IMPORT_ERR = e
-        print(
-            "lennoxs30api not installed. Run: bash scripts/lennox-s40 --setup\n"
+        raise CliError(
+            EX_DEPS,
+            "lennoxs30api not installed. Run: bash scripts/lennox-s40 --setup "
             "or: pip install -r requirements.txt",
-            file=sys.stderr,
-        )
-        raise SystemExit(2) from e
+        ) from e
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1130,7 +1129,11 @@ def main(argv=None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as e:
-        return int(e.code) if e.code is not None else 1
+        # argparse uses 2 for usage errors; map to EX_BAD_REQ so it never
+        # collides with EX_DEPS (missing lennoxs30api).
+        if e.code in (0, None):
+            return 0 if e.code == 0 else EX_BAD_REQ
+        return EX_BAD_REQ
 
     if getattr(args, "version", False) and not args.cmd:
         return cmd_version(args)
@@ -1148,6 +1151,7 @@ def main(argv=None) -> int:
     except CliError as e:
         return int(e.code)
     except SystemExit as e:
+        # Prefer CliError; bare SystemExit from libraries
         if isinstance(e.code, int):
             return e.code
         return EX_NOT_FOUND

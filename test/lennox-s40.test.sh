@@ -49,15 +49,18 @@ v=$(run_py version)
 [[ -n "$v" ]] || fail "version empty"
 pass "version $v"
 
-# dead IP without rediscover / lan scan
+# dead IP without rediscover / lan scan — must drive real CLI and assert EX_NOT_FOUND=1
+# (do not use `env run_py`: env cannot invoke shell functions → false 127)
 set +e
 out="$(
-  env -u LENNOX_IP LENNOX_CONFIG="$tmpdir/nope.json" LENNOX_NO_LAN_SCAN=1 \
-    run_py --ip 203.0.113.1 --no-rediscover status 2>&1
+  env -u LENNOX_IP LENNOX_NO_LAN_SCAN=1 LENNOX_CONFIG="$tmpdir/nope.json" \
+    "$LENNOX_PYTHON" "$py" --ip 203.0.113.1 --no-rediscover status 2>&1
 )"
 rc=$?
 set -e
-[[ "$rc" -ne 0 ]] || fail "dead ip must fail: $out"
+[[ "$rc" -eq 1 ]] || fail "dead ip must exit 1 (EX_NOT_FOUND), got $rc: $out"
+printf '%s\n' "$out" | grep -qi 'Connect failed\|No reachable\|No thermostat' \
+  || fail "dead ip message missing: $out"
 pass "fail-closed dead ip (rc=$rc)"
 
 # python parse

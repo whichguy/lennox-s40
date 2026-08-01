@@ -6,17 +6,19 @@ usage() {
   cat <<'EOF'
 Usage: lennox-s40 [--setup] [--] [cli args...]
 
-Commands (after deps): discover | status | mode | cool | heat | fan | away
+Commands: version | config | discover | status | mode | cool | heat | fan | away | hold
   lennox-s40 discover
   lennox-s40 --ip 192.168.1.10 status
   lennox-s40 cool 76 --zone Downstairs
+  lennox-s40 hold off --zone Downstairs
 
 Environment:
-  LENNOX_IP       Thermostat IP or mDNS name (required for control unless --ip)
-  LENNOX_APP_ID   Unique client id (default mapp…827200 — change if clashing)
+  LENNOX_IP       Thermostat IP or mDNS name (else config / discover)
+  LENNOX_APP_ID   Optional client id (else unique install-scoped id in config)
   LENNOX_PYTHON   Python interpreter override
   LENNOX_VENV     Venv directory (default: $XDG_DATA_HOME/lennox-s40/venv
                   or ~/.local/share/lennox-s40/venv)
+  LENNOX_CONFIG   Running config path (default ~/.config/lennox-s40/config.json)
 
   --setup         Create venv and pip install requirements.txt, then exit 0
 EOF
