@@ -1,0 +1,21 @@
+{
+  "name": "lennox-s40",
+  "version": "0.1.0",
+  "description": "Control a Lennox S40 (and S30/E30 LAN) smart thermostat over the local network: read status, set mode/setpoints/fan/away. Use when the user mentions home AC, heat, thermostat, Lennox Home, S40 zones, or HVAC setpoints. Local HTTPS only (no Lennox cloud). Requires LAN reachability and one-time scripts/lennox-s40 --setup.",
+  "author": {
+    "name": "whichguy",
+    "url": "https://github.com/whichguy"
+  },
+  "homepage": "https://github.com/whichguy/lennox-s40",
+  "repository": "https://github.com/whichguy/lennox-s40",
+  "license": "MIT",
+  "keywords": [
+    "lennox",
+    "s40",
+    "thermostat",
+    "hvac",
+    "smart-home",
+    "local-api",
+    "portable-skills"
+  ]
+}

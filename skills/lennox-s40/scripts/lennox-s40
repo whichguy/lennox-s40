@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Lennox S40 local LAN CLI — resolve Python + lennoxs30api, then run lennox_s40.py
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: lennox-s40 [--setup] [--] [cli args...]
+
+Commands (after deps): discover | status | mode | cool | heat | fan | away
+  lennox-s40 discover
+  lennox-s40 --ip 192.168.1.10 status
+  lennox-s40 cool 76 --zone Downstairs
+
+Environment:
+  LENNOX_IP       Thermostat IP or mDNS name (required for control unless --ip)
+  LENNOX_APP_ID   Unique client id (default mapp…827200 — change if clashing)
+  LENNOX_PYTHON   Python interpreter override
+  LENNOX_VENV     Venv directory (default: $XDG_DATA_HOME/lennox-s40/venv
+                  or ~/.local/share/lennox-s40/venv)
+
+  --setup         Create venv and pip install requirements.txt, then exit 0
+EOF
+}
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+py_script="$here/lennox_s40.py"
+req="$here/../requirements.txt"
+[[ -f "$py_script" ]] || { printf 'lennox-s40: missing %s\n' "$py_script" >&2; exit 2; }
+
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+venv_dir="${LENNOX_VENV:-$data_home/lennox-s40/venv}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+do_setup=0
+if [[ "${1:-}" == "--setup" ]]; then
+  do_setup=1
+  shift
+fi
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+pick_bootstrap_python() {
+  if [[ -n "${LENNOX_PYTHON:-}" ]]; then
+    printf '%s\n' "$LENNOX_PYTHON"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+ensure_venv() {
+  local boot
+  boot="$(pick_bootstrap_python)" || {
+    printf 'lennox-s40: python3 not found (set LENNOX_PYTHON)\n' >&2
+    exit 2
+  }
+  if [[ ! -x "$venv_dir/bin/python" ]]; then
+    mkdir -p "$(dirname "$venv_dir")"
+    "$boot" -m venv "$venv_dir"
+  fi
+  # shellcheck disable=SC1091
+  # install deps
+  "$venv_dir/bin/pip" install -q -U pip
+  if [[ -f "$req" ]]; then
+    "$venv_dir/bin/pip" install -q -r "$req"
+  else
+    "$venv_dir/bin/pip" install -q lennoxs30api aiohttp pytz
+  fi
+}
+
+python_ready() {
+  local py="$1"
+  "$py" -c 'import lennoxs30api, aiohttp, pytz' >/dev/null 2>&1
+}
+
+resolve_python() {
+  if [[ -n "${LENNOX_PYTHON:-}" ]] && python_ready "$LENNOX_PYTHON"; then
+    printf '%s\n' "$LENNOX_PYTHON"
+    return 0
+  fi
+  if [[ -x "$venv_dir/bin/python" ]] && python_ready "$venv_dir/bin/python"; then
+    printf '%s\n' "$venv_dir/bin/python"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1 && python_ready "$(command -v python3)"; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+if [[ "$do_setup" -eq 1 ]]; then
+  ensure_venv
+  printf 'lennox-s40: ready (venv %s)\n' "$venv_dir"
+  exit 0
+fi
+
+py=""
+if ! py="$(resolve_python)"; then
+  printf 'lennox-s40: lennoxs30api not importable. Run once:\n' >&2
+  printf '  %s --setup\n' "$0" >&2
+  printf 'Or: pip install -r %s\n' "$req" >&2
+  exit 2
+fi
+
+exec "$py" "$py_script" "$@"
