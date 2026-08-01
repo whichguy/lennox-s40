@@ -132,11 +132,13 @@ python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())
 rm -rf "$(dirname "$py")/__pycache__"
 pass "python syntax"
 
-# version parity
+# version parity (four surfaces)
 py_ver=$(python3 -c "import re; t=open('$py').read(); print(re.search(r'VERSION = \"([^\"]+)\"', t).group(1))")
 skill_ver=$(python3 -c "import re; t=open('$skill/SKILL.md').read(); print(re.search(r'^version:\s*(\S+)', t, re.M).group(1))")
 plugin_ver=$(python3 -c "import json; print(json.load(open('$root/.claude-plugin/plugin.json'))['version'])")
-[[ "$py_ver" == "$skill_ver" && "$py_ver" == "$plugin_ver" ]] || fail "version drift $py_ver $skill_ver $plugin_ver"
+pyproject_ver=$(python3 -c "import re; t=open('$root/pyproject.toml').read(); print(re.search(r'^version = \"([^\"]+)\"', t, re.M).group(1))")
+[[ "$py_ver" == "$skill_ver" && "$py_ver" == "$plugin_ver" && "$py_ver" == "$pyproject_ver" ]] \
+  || fail "version drift $py_ver $skill_ver $plugin_ver $pyproject_ver"
 pass "version parity $py_ver"
 
 printf 'lennox-s40.test.sh: PASS\n'

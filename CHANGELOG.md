@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 — 2026-08-01
+
+### Correctness
+- **Malformed existing config fails closed** (exit 3; file preserved; path on stderr)
+- Wrapper dispatches `version` / `--version` / `--help` / `config *` without requiring venv deps
+- **Discover persists only after session-verified identity**
+- **`discover --probe-only` does not write config** (including generated app_id)
+- Exit taxonomy enforced end-to-end: `0`–`5`; bare out-of-range `SystemExit` → device error (4)
+- `status` may emit JSON with `"ready": false` and still exit **5**
+- Doc↔code contract tests; four-way version parity (py / SKILL / plugin / pyproject)
+
+### Docs
+- SKILL/README/ops/setup aligned to session-verified discover, full exits, installed-path invocation
+- host-matrix: exit pointer + dep-free vs network notes
+
 ## 0.2.0 — 2026-08-01
 
 ### Security / correctness
@@ -7,18 +22,14 @@
 - Unique install-scoped `app_id` (migrate off shared library default)
 - CLI `--app-id` takes precedence over config
 - Config save: unique temp file, `0600` at create, fsync, flock
-- **Malformed existing config fails closed** (exit 3; file preserved; path on stderr)
-- Wrapper dispatches `version` / `--version` / `--help` / `config *` without requiring venv deps
 - Probe prefers Lennox TLS CN; LAN /24 scan opt-in only (`--lan-scan`)
 - Rediscover on session/connect failure; exclude failed IP
-- **Discover persists only after session-verified identity** (`--probe-only` skips save)
 - Clear/replace stale host when identity changes
 - Schedule **hold** command; report `schedule_hold_created` on setpoints
 - Write validation: finite temps, away on|off only, multi-zone requires `--zone`
 - Single-setpoint mode uses `r_sp`
 - Verify-after-write; readiness deadline (exit 5 if not ready)
 - Status redaction by default (`--full` for diagnostics)
-- Exit taxonomy: `0` ok · `1` not found · `2` deps · `3` bad request · `4` device · `5` timeout
 
 ### Install / SDLC
 - `install.sh`: exit 0 for `--*-only`; dry-run creates no dirs; Hermes marker provenance

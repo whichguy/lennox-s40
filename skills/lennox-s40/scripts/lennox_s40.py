@@ -33,7 +33,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Lazy-loaded upstream client (optional for config/discover without venv)
 s30api_async = None  # type: ignore
@@ -216,8 +216,12 @@ def env_app_id() -> str:
     return os.environ.get("LENNOX_APP_ID", "").strip()
 
 
-def effective_app_id(args, cfg: dict[str, Any]) -> str:
-    """Precedence: --app-id > LENNOX_APP_ID > config (non-legacy) > generate."""
+def effective_app_id(args, cfg: dict[str, Any], *, persist: bool = True) -> str:
+    """Precedence: --app-id > LENNOX_APP_ID > config (non-legacy) > generate.
+
+    When ``persist`` is False (e.g. ``discover --probe-only``), a generated id is
+    returned without writing config — zero filesystem write for probe-only.
+    """
     flag = getattr(args, "app_id", None)
     if flag:
         return str(flag).strip()
@@ -228,10 +232,12 @@ def effective_app_id(args, cfg: dict[str, Any]) -> str:
         return existing
     # migrate off shared library default
     new_id = generate_app_id()
+    if not persist:
+        return new_id
     cfg = dict(cfg)
     cfg["app_id"] = new_id
     save_config(cfg)
-    print(f"lennox-s40: generated unique app_id (saved to config)", file=sys.stderr)
+    print("lennox-s40: generated unique app_id (saved to config)", file=sys.stderr)
     return new_id
 
 
@@ -282,7 +288,7 @@ def _tls_peer_cn(ip: str, timeout: float = PROBE_TIMEOUT) -> Optional[str]:
 
 def _cn_from_der(der: bytes) -> Optional[str]:
     try:
-        # stdlib only: use ssl to re-dump via openssl not available; try cryptography-free regex on openssl x509
+        # stdlib only: openssl x509 CN extract (cryptography-free)
         # Fallback: shell openssl if present
         import subprocess as sp
 
@@ -669,7 +675,9 @@ async def session(args):
                 pass
 
 
-def pick_zone(system, zone_arg: Optional[str], *, first_zone: bool = False, for_write: bool = False):
+def pick_zone(
+    system, zone_arg: Optional[str], *, first_zone: bool = False, for_write: bool = False
+):
     zones = list(system.zone_list)
     active = [z for z in zones if getattr(z, "temperature", None) is not None]
     if not zones:
@@ -703,7 +711,11 @@ def pick_zone(system, zone_arg: Optional[str], *, first_zone: bool = False, for_
         raise CliError(EX_BAD_REQ, f"Ambiguous zone name {zone_arg!r}")
     partial = [z for z in zones if needle in (getattr(z, "name", None) or "").lower()]
     if for_write:
-        raise CliError(EX_BAD_REQ, f"No exact zone match for {zone_arg!r} (substring match disabled for writes)")
+        raise CliError(
+            EX_BAD_REQ,
+            f"No exact zone match for {zone_arg!r} "
+            "(substring match disabled for writes)",
+        )
     if len(partial) == 1:
         return partial[0]
     if len(partial) > 1:
@@ -859,10 +871,15 @@ async def cmd_cool(args) -> int:
         ssp = bool(getattr(system, "single_setpoint_mode", False))
         if ssp:
             await z.perform_setpoint(r_sp=temp)
-            pred = lambda zz: getattr(zz, "sp", None) == temp
+
+            def pred(zz, t=temp):
+                return getattr(zz, "sp", None) == t
         else:
             await z.perform_setpoint(r_csp=temp)
-            pred = lambda zz: getattr(zz, "csp", None) == temp
+
+            def pred(zz, t=temp):
+                return getattr(zz, "csp", None) == t
+
         ok = await _verify_zone(api, z, pred)
         hold_after = _zone_hold(z)
         print(
@@ -891,10 +908,15 @@ async def cmd_heat(args) -> int:
         ssp = bool(getattr(system, "single_setpoint_mode", False))
         if ssp:
             await z.perform_setpoint(r_sp=temp)
-            pred = lambda zz: getattr(zz, "sp", None) == temp
+
+            def pred(zz, t=temp):
+                return getattr(zz, "sp", None) == t
         else:
             await z.perform_setpoint(r_hsp=temp)
-            pred = lambda zz: getattr(zz, "hsp", None) == temp
+
+            def pred(zz, t=temp):
+                return getattr(zz, "hsp", None) == t
+
         ok = await _verify_zone(api, z, pred)
         hold_after = _zone_hold(z)
         print(
@@ -942,7 +964,12 @@ async def cmd_away(args) -> int:
         # _verify_zone expects zone-like; use manual pump
         await _pump_n(api, 8)
         ok = bool(getattr(system, "manualAwayMode", None)) is on
-        print(json.dumps({"ok": ok, "verified": ok, "manual_away": system.manualAwayMode}, indent=2))
+        print(
+            json.dumps(
+                {"ok": ok, "verified": ok, "manual_away": system.manualAwayMode},
+                indent=2,
+            )
+        )
         return EX_OK if ok else EX_TIMEOUT
 
 
@@ -978,8 +1005,11 @@ async def cmd_hold(args) -> int:
 
 def cmd_discover(args) -> int:
     cfg = load_config()
-    app_id = effective_app_id(args, cfg)
-    cfg = load_config()
+    # --probe-only must not create/update config (including generated app_id).
+    probe_only = bool(getattr(args, "probe_only", False))
+    app_id = effective_app_id(args, cfg, persist=not probe_only)
+    if not probe_only:
+        cfg = load_config()
     print(f"config: {config_path()}")
     print(f"probe: POST https://<ip>/Endpoints/{app_id}/Connect (+ CN=Lennox preferred)")
     print()
@@ -1004,7 +1034,7 @@ def cmd_discover(args) -> int:
     if first:
         # Persist only after a full session proves identity (needs lennoxs30api).
         # --probe-only: print match without writing config.
-        if getattr(args, "probe_only", False):
+        if probe_only:
             print()
             print(f"probe-only match: ip={first['ip']} (config not written)")
             return EX_OK
@@ -1161,10 +1191,10 @@ def main(argv=None) -> int:
     except CliError as e:
         return int(e.code)
     except SystemExit as e:
-        # Prefer CliError; bare SystemExit from libraries
-        if isinstance(e.code, int):
+        # Prefer CliError; bare SystemExit from libraries — stay within EX_* 0–5
+        if isinstance(e.code, int) and 0 <= e.code <= 5:
             return e.code
-        return EX_NOT_FOUND
+        return EX_DEVICE
     except Exception as e:
         name = type(e).__name__
         if name == "S30Exception" or "S30" in name:

@@ -1,6 +1,6 @@
 [project]
 name = "lennox-s40"
-version = "0.2.0"
+version = "0.2.1"
 description = "Standalone portable skill: local LAN control for Lennox S40"
 readme = "README.md"
 requires-python = ">=3.10"

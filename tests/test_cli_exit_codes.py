@@ -39,3 +39,26 @@ def test_dead_ip_no_rediscover(tmp_path, monkeypatch, capsys):
 def test_missing_cmd_is_bad_req():
     rc = m.main([])
     assert rc == m.EX_BAD_REQ
+
+
+def test_bare_systemexit_out_of_range_is_device(monkeypatch):
+    """Library SystemExit with code outside 0–5 maps to EX_DEVICE."""
+    import argparse
+
+    def boom(_args):
+        raise SystemExit(127)
+
+    class FakeParser:
+        def parse_args(self, argv):
+            return argparse.Namespace(
+                cmd="x",
+                version=False,
+                func=boom,
+                no_lan_scan=False,
+                lan_scan=False,
+                ip=None,
+                app_id=None,
+            )
+
+    monkeypatch.setattr(m, "build_parser", lambda: FakeParser())
+    assert m.main([]) == m.EX_DEVICE

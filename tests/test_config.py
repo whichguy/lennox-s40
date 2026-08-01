@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
-
-import pytest
 
 import lennox_s40 as m
+import pytest
 
 
 def test_load_missing(tmp_path, monkeypatch):

@@ -10,9 +10,8 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
-import pytest
-
 import lennox_s40 as m
+import pytest
 
 
 def _zone(**kwargs):

@@ -3,9 +3,8 @@ from __future__ import annotations
 
 import argparse
 
-import pytest
-
 import lennox_s40 as m
+import pytest
 
 APP = "mappTEST000000000000000001"
 
